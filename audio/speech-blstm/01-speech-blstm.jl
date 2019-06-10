@@ -5,8 +5,9 @@
 # bidirectional LSTM and other neural network architectures. Neural
 # Networks, 18(5-6), 602-610.]).
 
+# using CuArrays # uncomment to run the model on GPU
 using Flux
-using Flux: crossentropy, softmax, flip, sigmoid, LSTM, @epochs
+using Flux: crossentropy, softmax, sigmoid, LSTM, @epochs
 using BSON
 using Random
 
@@ -16,9 +17,9 @@ const TESTDIR = "test"
 const EPOCHS = 20
 
 # Component layers of the bidirectional LSTM layer
-forward = LSTM(26, 93)
-backward = LSTM(26, 93)
-output = Dense(186, 61)
+forward = LSTM(26, 93) |> gpu
+backward = LSTM(26, 93) |> gpu
+output = Dense(186, 61) |> gpu
 
 """
   BLSTM(x)
@@ -33,7 +34,11 @@ is from processing it backward
 # Returns
 * The concatenation of the forward and backward LSTM predictions
 """
-BLSTM(x) = vcat.(forward.(x), flip(backward, x))
+function BLSTM(x)
+    fx = forward.([x[i,:] for i=1:size(x,1)])
+    bx = backward.([x[i,:] for i=size(x,1):-1:1])    
+    vcat.(fx, bx[end:-1:1])
+end
 
 """
   model(x)
@@ -65,7 +70,7 @@ in `x`
 * Resets the state in the BLSTM layer
 """
 function loss(x, y)
-  l = sum(crossentropy.(model(x), y))
+  l = sum(crossentropy.(model(x), [y[:, j] for j=1:size(y, 2)]))
   Flux.reset!((forward, backward))
   return l
 end
@@ -87,14 +92,12 @@ the frames for one utterance
 function readData(dataDir)
   fnames = readdir(dataDir)
 
-  Xs = Vector()
-  Ys = Vector()
+  Xs = Vector{Matrix{Float64}}()
+  Ys = Vector{Flux.OneHotMatrix}()
   
   for (i, fname) in enumerate(fnames)
     print(string(i) * "/" * string(length(fnames)) * "\r")
     BSON.@load joinpath(dataDir, fname) x y
-    x = [x[i,:] for i in 1:size(x,1)]
-    y = [y[:,i] for i in 1:size(y,2)]
     push!(Xs, x)
     push!(Ys, y)
   end
@@ -120,7 +123,7 @@ correct predictions over the total number of predictions made
 function evaluateAccuracy(data)
   correct = Vector()
   for (x, y) in data
-    y = argmax.(y)
+    y = argmax.([y[:, j] for j=1:size(y, 2)])
     ŷ = argmax.(model(x))
     Flux.reset!((forward, backward))
     append!(correct, [ŷ_n == y_n for (ŷ_n, y_n) in zip(ŷ, y)])
@@ -132,26 +135,27 @@ function main()
 
   println("Loading files")
   Xs, Ys = readData(TRAINDIR)
+  Xs = gpu.(Xs)
+  Ys = gpu.(Ys)
   data = collect(zip(Xs, Ys))
 
   valData = data[1:184]
   data = data[185:end]
+  @info "Data size $(length(data))"
 
   # Begin training
   println("Beginning training")
+  
+  model_params = params(forward, backward, output)
+  opt = Momentum(10.0^-5)
 
-  opt = Momentum(params((forward, backward, output)), 10.0^-5; ρ=0.9)
-
-  i = 0
-
-  @epochs EPOCHS begin
-
-    i += 1
+  for i=1:EPOCHS
+    @info "Epoch $i"
 
     shuffle!(data)
     valData = valData[shuffle(1:length(valData))]
     
-    Flux.train!(loss, data, opt)
+    @time Flux.train!(loss, model_params, data, opt)
     
     BSON.@save "model_epoch$(i).bson" forward backward output
 
